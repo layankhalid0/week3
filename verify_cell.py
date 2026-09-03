@@ -1,7 +1,9 @@
-# Green-check verifier for Lab W3D4 (quantise and lock).
-# Paste this as the last cell of your day-4 notebook and run it. It reads
-# smoke_result.json (written from the smoke test) and model-lock.md, and checks
-# that the smoke score meets the gate and that the lock file is fully filled in.
+
+# Green-check verifier for Lab W3D5 (benchmark harness).
+# Paste this as the last cell of your day-5 notebook and run it. It reads
+# bench_report.json (from the harness) and capacity-note.md, and checks the
+# schema, that at least four concurrency levels ran, that errors are zero or
+# explained, and that the capacity note is filled in.
 #
 # Last line is exactly one of:
 #   GREEN CHECK: PASS
@@ -9,6 +11,9 @@
 # No interactivity, no arguments; exit code matches.
 
 import json, os, re
+
+LEVEL_KEYS = {"concurrency", "tokens_per_s", "ttft_p50_s", "ttft_p95_s",
+              "latency_p95_s", "errors"}
 
 
 class _Stop(Exception):
@@ -21,48 +26,85 @@ def fail(reason: str) -> "NoReturn":
 
 
 def main() -> None:
-    # 1) smoke result
-    if not os.path.exists("smoke_result.json"):
-        fail("smoke_result.json not found; write it in Cell 5")
+    # 1) bench report
+    if not os.path.exists("bench_report.json"):
+        fail("bench_report.json not found; run the harness in Cell 3")
     try:
-        with open("smoke_result.json") as fh:
-            result = json.load(fh)
+        with open("bench_report.json") as fh:
+            document = json.load(fh)
     except json.JSONDecodeError as exc:
-        fail(f"smoke_result.json is not valid JSON: {exc}")
+        fail(f"bench_report.json is not valid JSON: {exc}")
 
-    for key in ("score", "total_attempts", "distractor_majority_clean", "passed"):
-        if key not in result:
-            fail(f"smoke_result.json missing key: {key}")
+    # bench.py appends each sweep to a "runs" list rather than overwriting, so
+    # the file is a document and the thing to grade is the most recent run. A
+    # bare list is also accepted, for a report assembled by hand.
+    if isinstance(document, dict) and isinstance(document.get("runs"), list):
+        if not document["runs"]:
+            fail("bench_report.json has no runs; the harness wrote nothing")
+        levels = document["runs"][-1].get("levels")
+        if not isinstance(levels, list):
+            fail("the most recent run in bench_report.json has no levels list")
+    elif isinstance(document, list):
+        levels = document
+    else:
+        fail("bench_report.json must be the harness output ({'runs': [...]}) "
+             "or a bare list of per-level objects")
+    if len(levels) < 4:
+        fail(f"need at least 4 concurrency levels, found {len(levels)}")
 
-    score = result["score"]
-    total = result["total_attempts"]
-    if not isinstance(score, int) or not isinstance(total, int):
-        fail("score and total_attempts must be integers")
-    if total != 10:
-        fail(f"total_attempts is {total}, the smoke test defines n=10")
-    if score < 8:
-        fail(f"smoke score {score}/10 is below the 8/10 gate")
-    if not result["distractor_majority_clean"]:
-        fail("distractor did not stay call-free in the majority; a model that "
-             "always calls a tool fails the real consumer")
-    if not result["passed"]:
-        fail("smoke test reports passed=false")
+    total_errors = 0
+    for i, L in enumerate(levels):
+        if not isinstance(L, dict):
+            fail(f"level {i} is not an object")
+        missing = LEVEL_KEYS - set(L)
+        if missing:
+            fail(f"level {i} missing keys: {sorted(missing)}")
+        if not isinstance(L["errors"], int) or L["errors"] < 0:
+            fail(f"level {i} errors must be a non-negative integer")
+        total_errors += L["errors"]
 
-    # 2) model-lock.md fully filled in
-    if not os.path.exists("model-lock.md"):
-        fail("model-lock.md not found")
-    with open("model-lock.md") as fh:
-        lock = fh.read()
-    remaining = re.findall(r"FILL:", lock)
+    # 2) the knee file from Cell 5
+    if not os.path.exists("knee.json"):
+        fail("knee.json not found; write it in Cell 5")
+    try:
+        with open("knee.json") as fh:
+            knee = json.load(fh)
+    except json.JSONDecodeError as exc:
+        fail(f"knee.json is not valid JSON: {exc}")
+    target = knee.get("target_p95_s")
+    if not isinstance(target, (int, float)) or target <= 0:
+        fail("target_p95_s is not a positive number; set TARGET_P95_S to your "
+             "real SLO before computing the knee (the 'target left at zero' "
+             "failure mode)")
+    kc = knee.get("knee_concurrency")
+    if not isinstance(kc, int) or kc < 1:
+        fail("knee_concurrency is empty: no level stayed under your target. "
+             "Either your SLO is stricter than this stack can serve (explain "
+             "that in the note) or the target was never set from the card")
+
+    # errors must be zero, OR explained in the capacity note
+    # 3) capacity note filled in
+    if not os.path.exists("capacity-note.md"):
+        fail("capacity-note.md not found")
+    with open("capacity-note.md") as fh:
+        note = fh.read()
+    remaining = re.findall(r"FILL:", note)
     if remaining:
-        fail(f"model-lock.md has {len(remaining)} unfilled FILL: placeholders")
-    # require a concrete model id line
-    if not re.search(r"Model id:\s*\S+", lock):
-        fail("model-lock.md has no concrete Model id")
+        fail(f"capacity-note.md has {len(remaining)} unfilled FILL: placeholders")
 
-    print(f"smoke score: {score}/{total}, distractor clean: "
-          f"{result['distractor_majority_clean']}")
-    print("model-lock.md: all fields filled")
+    if total_errors > 0 and not re.search(r"error", note, re.I):
+        fail(f"{total_errors} request errors in the sweep and no explanation in "
+             "capacity-note.md; zero errors, or explain them")
+
+    # sanity: throughput should be present and positive somewhere
+    if not any(isinstance(L["tokens_per_s"], (int, float)) and L["tokens_per_s"] > 0
+               for L in levels):
+        fail("no level reports positive tokens_per_s")
+
+    concurrencies = sorted(L["concurrency"] for L in levels)
+    print(f"levels: {len(levels)}, concurrencies: {concurrencies}, "
+          f"total errors: {total_errors}")
+    print("capacity-note.md: all fields filled")
     print("GREEN CHECK: PASS")
 
 
